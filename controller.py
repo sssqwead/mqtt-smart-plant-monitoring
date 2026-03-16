@@ -11,6 +11,9 @@ from config import (
     PLANT_PROFILES,
 )
 
+# Arystan's nutrient module
+from nutrient_module import evaluate_npk
+
 # Wildcard subscriptions — '+' matches any single topic level
 # This allows one controller to handle all plant types simultaneously
 SENSOR_TOPIC_SUB = "smartplant/+/sensor"
@@ -22,7 +25,7 @@ client = mqtt.Client(callback_api_version=app_version2)
 
 # Per-plant watering state — keyed by plant_id string
 # Stored as dicts so multiple plants are tracked independently
-is_watering: dict[str, bool]    = {}
+is_watering: dict[str, bool] = {}
 last_cmd_time: dict[str, float] = {}
 
 # Tracks active alert types per plant to avoid re-publishing every cycle
@@ -72,14 +75,14 @@ def init_db():
     )
 
     # Backward-compatible migration: add any missing columns to existing databases
-    _add_column_if_missing(cursor, "sensor_data",  "plant_type",       "TEXT")
-    _add_column_if_missing(cursor, "sensor_data",  "nitrogen",         "REAL")
-    _add_column_if_missing(cursor, "sensor_data",  "phosphorus",       "REAL")
-    _add_column_if_missing(cursor, "sensor_data",  "potassium",        "REAL")
-    _add_column_if_missing(cursor, "sensor_data",  "soil_ph",          "REAL")
-    _add_column_if_missing(cursor, "sensor_data",  "salinity",         "REAL")
-    _add_column_if_missing(cursor, "sensor_data",  "root_temperature", "REAL")
-    _add_column_if_missing(cursor, "activity_log", "severity",         "TEXT DEFAULT 'INFO'")
+    _add_column_if_missing(cursor, "sensor_data", "plant_type", "TEXT")
+    _add_column_if_missing(cursor, "sensor_data", "nitrogen", "REAL")
+    _add_column_if_missing(cursor, "sensor_data", "phosphorus", "REAL")
+    _add_column_if_missing(cursor, "sensor_data", "potassium", "REAL")
+    _add_column_if_missing(cursor, "sensor_data", "soil_ph", "REAL")
+    _add_column_if_missing(cursor, "sensor_data", "salinity", "REAL")
+    _add_column_if_missing(cursor, "sensor_data", "root_temperature", "REAL")
+    _add_column_if_missing(cursor, "activity_log", "severity", "TEXT DEFAULT 'INFO'")
 
     connection.commit()
     connection.close()
@@ -147,15 +150,15 @@ def _severity_for_value(value, low, high):
     span = high - low if high != low else 1  # avoid division by zero
 
     if value < low:
-        deviation = (low - value) / span    # how far below the minimum
+        deviation = (low - value) / span
     elif value > high:
-        deviation = (value - high) / span   # how far above the maximum
+        deviation = (value - high) / span
     else:
-        return "INFO", False  # value is within range — no alert needed
+        return "INFO", False
 
     if deviation >= margin_crit:
         return "CRITICAL", True
-    return "WARNING", True  # any out-of-range value is at least a WARNING
+    return "WARNING", True
 
 
 def publish_alert(plant_id, plant_type, alert_type, severity, message):
@@ -174,12 +177,12 @@ def publish_alert(plant_id, plant_type, alert_type, severity, message):
 
     topic = ALERT_TOPIC.format(plant_id=plant_id)
     payload = {
-        "plant_id":   plant_id,
+        "plant_id": plant_id,
         "plant_type": plant_type,
-        "alert_type": alert_type,   # e.g. "LOW_MOISTURE", "PH_OUT_OF_RANGE"
-        "severity":   severity,     # "INFO", "WARNING", or "CRITICAL"
-        "message":    message,      # human-readable description
-        "timestamp":  time.strftime("%Y-%m-%d %H:%M:%S"),
+        "alert_type": alert_type,
+        "severity": severity,
+        "message": message,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     client.publish(topic, json.dumps(payload))
     log_activity("alert_published", json.dumps(payload), severity)
@@ -197,16 +200,15 @@ def send_command(plant_id, action, reason, severity="INFO"):
     """Publish a WATER_ON or WATER_OFF command and update local watering state."""
     topic = COMMAND_TOPIC.format(plant_id=plant_id)
     payload = {
-        "plant_id":  plant_id,
-        "action":    action,   # "WATER_ON" or "WATER_OFF"
-        "reason":    reason,   # human-readable reason for the command
+        "plant_id": plant_id,
+        "action": action,
+        "reason": reason,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     client.publish(topic, json.dumps(payload))
     log_activity("command_sent", json.dumps(payload), severity)
-    last_cmd_time[plant_id] = time.time()  # record when last command was sent
+    last_cmd_time[plant_id] = time.time()
 
-    # Update in-memory watering state for this plant
     if action == "WATER_ON":
         is_watering[plant_id] = True
     elif action == "WATER_OFF":
@@ -224,21 +226,24 @@ def evaluate_plant(data, profile, plant_id, plant_type):
     Clears alerts when values return to the normal range.
     """
     moisture = float(data.get("soil_moisture", 0))
-    now      = time.time()
-    watering = is_watering.get(plant_id, False)  # current pump state for this plant
+    now = time.time()
+    watering = is_watering.get(plant_id, False)
 
     # -- Moisture alerts --
     if moisture < profile["moisture_critical"] and not watering:
-        publish_alert(plant_id, plant_type, "LOW_MOISTURE", "CRITICAL",
-                      f"Soil moisture critically low: {moisture}%")
+        publish_alert(
+            plant_id, plant_type, "LOW_MOISTURE", "CRITICAL",
+            f"Soil moisture critically low: {moisture}%"
+        )
     elif moisture < profile["moisture_warning"] and not watering:
-        publish_alert(plant_id, plant_type, "LOW_MOISTURE", "WARNING",
-                      f"Soil moisture low: {moisture}%")
+        publish_alert(
+            plant_id, plant_type, "LOW_MOISTURE", "WARNING",
+            f"Soil moisture low: {moisture}%"
+        )
     else:
-        clear_alert(plant_id, "LOW_MOISTURE")  # moisture back to normal
+        clear_alert(plant_id, "LOW_MOISTURE")
 
     # -- Watering control --
-    # Start watering if moisture is below minimum and cooldown has elapsed
     if (
         moisture < profile["moisture_min"]
         and not watering
@@ -246,52 +251,55 @@ def evaluate_plant(data, profile, plant_id, plant_type):
     ):
         send_command(plant_id, "WATER_ON", "Soil moisture below threshold")
 
-    # Stop watering once moisture reaches the stop level
     elif moisture >= profile["moisture_stop"] and watering:
         send_command(plant_id, "WATER_OFF", "Soil moisture reached stop level")
 
-    # -- NPK checks --
-    # Iterate over all three nutrients and alert if any are out of range
-    for nutrient, key in [("Nitrogen", "nitrogen"), ("Phosphorus", "phosphorus"), ("Potassium", "potassium")]:
-        val = data.get(key)
-        if val is None:
-            continue  # skip if sensor didn't provide this field
-        sev, out = _severity_for_value(float(val), *profile[key])
-        if out:
-            publish_alert(plant_id, plant_type, f"{key.upper()}_OUT_OF_RANGE", sev,
-                          f"{nutrient} out of range: {val} mg/kg (optimal {profile[key][0]}–{profile[key][1]})")
-        else:
-            clear_alert(plant_id, f"{key.upper()}_OUT_OF_RANGE")  # value back in range
+    # -- Arystan's NPK checks --
+    evaluate_npk(
+        data,
+        profile,
+        plant_id,
+        plant_type,
+        _severity_for_value,
+        publish_alert,
+        clear_alert,
+    )
 
     # -- pH check --
     ph = data.get("soil_ph")
     if ph is not None:
         sev, out = _severity_for_value(float(ph), *profile["soil_ph"])
         if out:
-            publish_alert(plant_id, plant_type, "PH_OUT_OF_RANGE", sev,
-                          f"Soil pH out of range: {ph} (optimal {profile['soil_ph'][0]}–{profile['soil_ph'][1]})")
+            publish_alert(
+                plant_id, plant_type, "PH_OUT_OF_RANGE", sev,
+                f"Soil pH out of range: {ph} (optimal {profile['soil_ph'][0]}–{profile['soil_ph'][1]})"
+            )
         else:
-            clear_alert(plant_id, "PH_OUT_OF_RANGE")  # pH back in range
+            clear_alert(plant_id, "PH_OUT_OF_RANGE")
 
     # -- Salinity check --
     sal = data.get("salinity")
     if sal is not None:
         if float(sal) > profile["salinity"][1]:
             sev = "CRITICAL" if float(sal) > profile["salinity"][1] * 1.3 else "WARNING"
-            publish_alert(plant_id, plant_type, "HIGH_SALINITY", sev,
-                          f"Salinity too high: {sal} dS/m (max {profile['salinity'][1]})")
+            publish_alert(
+                plant_id, plant_type, "HIGH_SALINITY", sev,
+                f"Salinity too high: {sal} dS/m (max {profile['salinity'][1]})"
+            )
         else:
-            clear_alert(plant_id, "HIGH_SALINITY")  # salinity back in range
+            clear_alert(plant_id, "HIGH_SALINITY")
 
     # -- Root temperature check --
     rt = data.get("root_temperature")
     if rt is not None:
         sev, out = _severity_for_value(float(rt), *profile["root_temperature"])
         if out:
-            publish_alert(plant_id, plant_type, "ROOT_TEMP_OUT_OF_RANGE", sev,
-                          f"Root temperature out of range: {rt}°C (optimal {profile['root_temperature'][0]}–{profile['root_temperature'][1]})")
+            publish_alert(
+                plant_id, plant_type, "ROOT_TEMP_OUT_OF_RANGE", sev,
+                f"Root temperature out of range: {rt}°C (optimal {profile['root_temperature'][0]}–{profile['root_temperature'][1]})"
+            )
         else:
-            clear_alert(plant_id, "ROOT_TEMP_OUT_OF_RANGE")  # root temp back in range
+            clear_alert(plant_id, "ROOT_TEMP_OUT_OF_RANGE")
 
 
 # ── MQTT callbacks ────────────────────────────────────────────────────────────
@@ -300,36 +308,33 @@ def handle_sensor_message(data):
     """Save incoming sensor data to DB and run plant evaluation logic."""
     save_sensor_data(data)
 
-    plant_id   = data.get("plant_id", "unknown")
+    plant_id = data.get("plant_id", "unknown")
     plant_type = data.get("plant_type", "ficus")
-    profile    = PLANT_PROFILES.get(plant_type)  # look up thresholds for this plant type
+    profile = PLANT_PROFILES.get(plant_type)
 
     if profile is None:
-        # Unknown plant type — skip evaluation to avoid KeyErrors
         print(f"[controller] Unknown plant type '{plant_type}', skipping evaluation")
         return
 
     print(
         f"[controller] [{plant_type}] moisture={data.get('soil_moisture')}, "
         f"pH={data.get('soil_ph')}, N={data.get('nitrogen')}, "
+        f"P={data.get('phosphorus')}, K={data.get('potassium')}, "
         f"temp={data.get('temperature')}"
     )
 
-    # Run all threshold checks for this reading
     evaluate_plant(data, profile, plant_id, plant_type)
 
 
 def on_message(client, userdata, msg):
     """Route incoming MQTT messages to the correct handler."""
-    # Ignore any topic that doesn't belong to our plants
-    # This filters out noise from other users on the public HiveMQ broker
     if not msg.topic.startswith("smartplant/plant-"):
         return
 
     try:
-        payload = json.loads(msg.payload.decode())  # decode JSON bytes → dict
+        payload = json.loads(msg.payload.decode())
     except json.JSONDecodeError:
-        return  # silently drop malformed messages
+        return
 
     if msg.topic.endswith("/sensor"):
         handle_sensor_message(payload)
@@ -340,11 +345,11 @@ def on_message(client, userdata, msg):
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
-init_db()                          # ensure DB schema is ready
-client.on_message = on_message     # register message handler
-client.connect(BROKER, PORT)       # connect to broker
-client.subscribe(SENSOR_TOPIC_SUB) # subscribe to all plant sensor topics
-client.subscribe(STATUS_TOPIC_SUB) # subscribe to all plant status topics
+init_db()
+client.on_message = on_message
+client.connect(BROKER, PORT)
+client.subscribe(SENSOR_TOPIC_SUB)
+client.subscribe(STATUS_TOPIC_SUB)
 
 print("[controller] Connected")
 print(f"[controller] Listening on: {SENSOR_TOPIC_SUB}")
@@ -353,10 +358,9 @@ print(f"[controller] Listening on: {STATUS_TOPIC_SUB}")
 log_activity("controller_started", "Controller started and subscribed")
 
 try:
-    client.loop_forever()  # block and process MQTT messages indefinitely
+    client.loop_forever()
 except KeyboardInterrupt:
     print("\n[controller] Stopped")
 finally:
-    # Always log shutdown and disconnect cleanly
     log_activity("controller_stopped", "Controller stopped")
     client.disconnect()
