@@ -12,6 +12,9 @@ from config import (
     PLANT_PROFILES, DEFAULT_PLANT,
 )
 
+# Arystan's nutrient module
+from nutrient_module import init_npk, update_npk
+
 # ── Plant selection ───────────────────────────────────────────────────────────
 # Accept plant type as first CLI argument, e.g. "python publisher.py cactus"
 # Fall back to DEFAULT_PLANT if no argument is given
@@ -29,27 +32,28 @@ PLANT_ID = f"plant-{PLANT_TYPE}-001"
 profile = PLANT_PROFILES[PLANT_TYPE]
 
 # Build fully-qualified topic strings for this plant instance
-_sensor  = SENSOR_TOPIC.format(plant_id=PLANT_ID)
+_sensor = SENSOR_TOPIC.format(plant_id=PLANT_ID)
 _command = COMMAND_TOPIC.format(plant_id=PLANT_ID)
-_status  = STATUS_TOPIC.format(plant_id=PLANT_ID)
+_status = STATUS_TOPIC.format(plant_id=PLANT_ID)
 
 # ── Simulated environment state ───────────────────────────────────────────────
 # Initialise moisture halfway between start and stop thresholds plus a buffer
-soil_moisture   = (profile["moisture_min"] + profile["moisture_stop"]) / 2 + 10
-temperature     = 24.0   # ambient air temperature in °C
-humidity        = 60.0   # relative humidity in %
+soil_moisture = (profile["moisture_min"] + profile["moisture_stop"]) / 2 + 10
+temperature = 24.0   # ambient air temperature in °C
+humidity = 60.0      # relative humidity in %
 watering_active = False  # tracks whether the pump is currently ON
 
-# Helper: return the midpoint of a (min, max) tuple
-def _mid(rng): return (rng[0] + rng[1]) / 2
 
-# Seed extended sensor values at the midpoint of each plant's optimal range
-nitrogen         = _mid(profile["nitrogen"])
-phosphorus       = _mid(profile["phosphorus"])
-potassium        = _mid(profile["potassium"])
-soil_ph          = _mid(profile["soil_ph"])
-salinity         = _mid(profile["salinity"])
-root_temperature = _mid(profile["root_temperature"])
+# Arystan's NPK initialisation
+npk = init_npk(profile)
+nitrogen = npk["nitrogen"]
+phosphorus = npk["phosphorus"]
+potassium = npk["potassium"]
+
+# Other extended sensors
+soil_ph = (profile["soil_ph"][0] + profile["soil_ph"][1]) / 2
+salinity = (profile["salinity"][0] + profile["salinity"][1]) / 2
+root_temperature = (profile["root_temperature"][0] + profile["root_temperature"][1]) / 2
 
 # ── MQTT setup ────────────────────────────────────────────────────────────────
 # Use the newer VERSION2 callback API required by paho-mqtt 2.x
@@ -63,7 +67,7 @@ def on_message(client, userdata, msg):
 
     try:
         payload = json.loads(msg.payload.decode())  # decode bytes → dict
-        action  = payload.get("action", "")
+        action = payload.get("action", "")
     except json.JSONDecodeError:
         print("[publisher] Invalid command payload")
         return
@@ -78,10 +82,10 @@ def on_message(client, userdata, msg):
 
     # Publish actuator status back to the broker so controller and dashboard know
     status = {
-        "plant_id":        PLANT_ID,
-        "plant_type":      PLANT_TYPE,
+        "plant_id": PLANT_ID,
+        "plant_type": PLANT_TYPE,
         "watering_active": watering_active,
-        "timestamp":       time.strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     client.publish(_status, json.dumps(status))
 
@@ -107,27 +111,25 @@ try:
 
         # Ambient temperature and humidity drift slightly each cycle
         temperature += random.uniform(-0.2, 0.2)
-        humidity    += random.uniform(-1.0,  1.0)
-        temperature  = max(15.0, min(40.0, temperature))
-        humidity     = max(20.0, min(95.0, humidity))
+        humidity += random.uniform(-1.0, 1.0)
+        temperature = max(15.0, min(40.0, temperature))
+        humidity = max(20.0, min(95.0, humidity))
 
-        # NPK nutrients deplete slowly over time (plant consumption)
-        nitrogen   += random.uniform(-2.0, 1.0)
-        phosphorus += random.uniform(-1.0, 0.5)
-        potassium  += random.uniform(-1.5, 0.8)
-
-        # Clamp NPK to 50%–120% of the plant's optimal range
-        n_rng = profile["nitrogen"];   nitrogen   = max(n_rng[0]*0.5, min(n_rng[1]*1.2, nitrogen))
-        p_rng = profile["phosphorus"]; phosphorus = max(p_rng[0]*0.5, min(p_rng[1]*1.2, phosphorus))
-        k_rng = profile["potassium"];  potassium  = max(k_rng[0]*0.5, min(k_rng[1]*1.2, potassium))
+        # Arystan's NPK logic
+        nitrogen, phosphorus, potassium = update_npk(
+            profile, nitrogen, phosphorus, potassium
+        )
 
         # pH and salinity change very slowly
-        soil_ph  += random.uniform(-0.05, 0.05)
+        soil_ph += random.uniform(-0.05, 0.05)
         salinity += random.uniform(-0.02, 0.03)
 
         # Clamp pH and salinity to slightly outside their optimal bounds
-        ph_rng  = profile["soil_ph"];  soil_ph  = max(ph_rng[0]*0.9, min(ph_rng[1]*1.1, soil_ph))
-        s_rng   = profile["salinity"]; salinity = max(0.0,            min(s_rng[1]*1.5,  salinity))
+        ph_rng = profile["soil_ph"]
+        soil_ph = max(ph_rng[0] * 0.9, min(ph_rng[1] * 1.1, soil_ph))
+
+        s_rng = profile["salinity"]
+        salinity = max(0.0, min(s_rng[1] * 1.5, salinity))
 
         # Root temperature loosely follows ambient temperature
         root_temperature += random.uniform(-0.1, 0.1)
@@ -136,18 +138,18 @@ try:
 
         # Build the full sensor reading payload
         reading = {
-            "plant_id":         PLANT_ID,
-            "plant_type":       PLANT_TYPE,
-            "soil_moisture":    round(soil_moisture,    2),
-            "temperature":      round(temperature,      2),
-            "humidity":         round(humidity,         2),
-            "nitrogen":         round(nitrogen,         2),
-            "phosphorus":       round(phosphorus,       2),
-            "potassium":        round(potassium,        2),
-            "soil_ph":          round(soil_ph,          2),
-            "salinity":         round(salinity,         3),
+            "plant_id": PLANT_ID,
+            "plant_type": PLANT_TYPE,
+            "soil_moisture": round(soil_moisture, 2),
+            "temperature": round(temperature, 2),
+            "humidity": round(humidity, 2),
+            "nitrogen": round(nitrogen, 2),
+            "phosphorus": round(phosphorus, 2),
+            "potassium": round(potassium, 2),
+            "soil_ph": round(soil_ph, 2),
+            "salinity": round(salinity, 3),
             "root_temperature": round(root_temperature, 2),
-            "timestamp":        time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         # Publish the reading to the sensor topic
@@ -157,6 +159,8 @@ try:
             f"moisture={reading['soil_moisture']},",
             f"pH={reading['soil_ph']},",
             f"N={reading['nitrogen']},",
+            f"P={reading['phosphorus']},",
+            f"K={reading['potassium']},",
             f"temp={reading['temperature']}",
         )
 
