@@ -112,21 +112,6 @@ pip install -r requirements.txt
 python main.py
 ```
 
-### Run separately
-```bash
-# Terminal 1
-python controller.py
-
-# Terminal 2
-python publisher.py ficus
-
-# Terminal 3
-python publisher.py cactus
-
-# Terminal 4
-python dashboard.py
-```
-
 ---
 
 ## Database
