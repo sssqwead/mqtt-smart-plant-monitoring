@@ -1,74 +1,65 @@
+from __future__ import annotations
+
 import json
 import random
+import sys
 import time
 
 import paho.mqtt.client as mqtt
 
-BROKER = "broker.hivemq.com"
-PORT = 1883
-PLANT_ID = "plant-001"
-
-SENSOR_TOPIC = f"smartplant/{PLANT_ID}/sensor/root_temperature"
-STATUS_TOPIC = f"smartplant/{PLANT_ID}/status/root_temperature"
-
-root_temperature = 23.0
-
-app_version2 = mqtt.CallbackAPIVersion.VERSION2
-client = mqtt.Client(callback_api_version=app_version2)
+from config import BROKER, DEFAULT_PLANT, PLANT_PROFILES, PORT, SENSOR_TOPIC, build_plant_id
 
 
-def publish_status(message: str):
-    payload = {
-        "plant_id": PLANT_ID,
-        "sensor": "root_temperature",
-        "message": message,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    client.publish(STATUS_TOPIC, json.dumps(payload), qos=1)
+class SensorPublisher:
+    def __init__(self, plant_type: str) -> None:
+        plant_type = plant_type.lower()
+        if plant_type not in PLANT_PROFILES:
+            raise ValueError(f"Unknown plant type: {plant_type}")
 
+        self.plant_type = plant_type
+        self.plant_id = build_plant_id(plant_type)
+        self.topic = SENSOR_TOPIC.format(plant_id=self.plant_id)
 
-def main():
-    global root_temperature
+        low, high = PLANT_PROFILES[self.plant_type]["root_temperature"]
+        self.value = random.uniform(low, high)
 
-    try:
-        client.connect(BROKER, PORT, 60)
-        client.loop_start()
-    except Exception as e:
-        print("root temperature publisher connection failed:", e)
-        return
+        self.client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 
-    print("Root Temperature Publisher connected")
-    print("Publishing to:", SENSOR_TOPIC)
+    def _next_value(self) -> float:
+        low, high = PLANT_PROFILES[self.plant_type]["root_temperature"]
+        self.value += random.uniform(-0.30, 0.30)
+        self.value = max(low - 5, min(high + 5, self.value))
+        return round(self.value, 2)
 
-    publish_status("root_temperature publisher started")
+    def publish(self) -> None:
+        self.client.connect(BROKER, PORT)
+        self.client.loop_start()
+        print(f"[publisher_root_temp] topic: {self.topic}")
 
-    try:
-        while True:
-            root_temperature += random.uniform(-0.30, 0.30)
-            root_temperature = max(10.0, min(35.0, root_temperature))
-
-            reading = {
-                "plant_id": PLANT_ID,
-                "sensor": "root_temperature",
-                "value": round(root_temperature, 2),
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-            client.publish(SENSOR_TOPIC, json.dumps(reading), qos=1)
-            print("Sent root_temperature =", reading["value"])
-
-            time.sleep(5)
-
-    except KeyboardInterrupt:
-        print("Root Temperature Publisher stopped")
-    finally:
         try:
-            publish_status("root_temperature publisher stopped")
-            client.loop_stop()
-            client.disconnect()
-        except Exception:
-            pass
+            while True:
+                payload = {
+                    "plant_id": self.plant_id,
+                    "plant_type": self.plant_type,
+                    "root_temperature": self._next_value(),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                self.client.publish(self.topic, json.dumps(payload))
+                print(f"[publisher_root_temp] sent: {payload['root_temperature']}°C")
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[publisher_root_temp] stopped")
+        finally:
+            self.client.loop_stop()
+            self.client.disconnect()
+
+
+def main() -> int:
+    plant_type = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PLANT
+    publisher = SensorPublisher(plant_type)
+    publisher.publish()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
