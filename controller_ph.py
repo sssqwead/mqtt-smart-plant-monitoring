@@ -1,152 +1,107 @@
+from __future__ import annotations
+
 import json
-import sqlite3
 import time
 
 import paho.mqtt.client as mqtt
 
-BROKER = "broker.hivemq.com"
-PORT = 1883
-PLANT_ID = "plant-001"
-
-SENSOR_TOPIC = f"smartplant/{PLANT_ID}/sensor/soil_ph"
-STATUS_TOPIC = f"smartplant/{PLANT_ID}/status/soil_ph"
-ALERT_TOPIC = f"smartplant/{PLANT_ID}/alert/soil_ph"
-
-DB_PATH = "plant_monitoring.db"
-
-app_version2 = mqtt.CallbackAPIVersion.VERSION2
-client = mqtt.Client(callback_api_version=app_version2)
+from config import ALERT_TOPIC, BROKER, PLANT_PROFILES, PORT, SENSOR_TOPIC
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+class SensorController:
+    def __init__(self) -> None:
+        self.sensor_key = "soil_ph"
+        self.alert_type = "PH_OUT_OF_RANGE"
+        self.topic_sub = SENSOR_TOPIC.replace("{plant_id}", "+")
+        self.client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self.client.on_message = self.on_message
+        self.active_alerts: dict[str, str] = {}
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS soil_ph_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            plant_id TEXT,
-            value REAL,
-            status TEXT
-        )
-    """)
+    def _severity_for_value(self, value: float, low: float, high: float) -> tuple[str, bool]:
+        margin_warn = 0.10
+        margin_crit = 0.20
+        span = high - low if high != low else 1.0
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS soil_ph_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            event_type TEXT,
-            details TEXT
-        )
-    """)
+        if value < low:
+            deviation = (low - value) / span
+        elif value > high:
+            deviation = (value - high) / span
+        else:
+            return "INFO", False
 
-    conn.commit()
-    conn.close()
+        if deviation >= margin_crit:
+            return "CRITICAL", True
+        return "WARNING", True
 
+    def _publish_alert(self, plant_id: str, plant_type: str, severity: str, value: float, low: float, high: float) -> None:
+        if self.active_alerts.get(plant_id) == severity:
+            return
 
-def log_event(event_type, details):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO soil_ph_log (timestamp, event_type, details)
-        VALUES (?, ?, ?)
-    """, (time.strftime("%Y-%m-%d %H:%M:%S"), event_type, details))
-    conn.commit()
-    conn.close()
+        self.active_alerts[plant_id] = severity
 
+        topic = ALERT_TOPIC.format(plant_id=plant_id)
+        payload = {
+            "plant_id": plant_id,
+            "plant_type": plant_type,
+            "alert_type": self.alert_type,
+            "severity": severity,
+            "message": f"Soil pH out of range: {value} (optimal {low}–{high})",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.client.publish(topic, json.dumps(payload))
+        print(f"[controller_ph] ALERT [{severity}] {payload['message']}")
 
-def classify_ph(value):
-    if value < 5.5:
-        return "LOW"
-    elif value > 7.5:
-        return "HIGH"
-    return "NORMAL"
+    def _clear_alert(self, plant_id: str) -> None:
+        self.active_alerts.pop(plant_id, None)
 
-
-def save_data(data, status):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO soil_ph_data (timestamp, plant_id, value, status)
-        VALUES (?, ?, ?, ?)
-    """, (
-        data.get("timestamp"),
-        data.get("plant_id"),
-        data.get("value"),
-        status,
-    ))
-    conn.commit()
-    conn.close()
-
-
-def publish_alert(value, status):
-    payload = {
-        "plant_id": PLANT_ID,
-        "sensor": "soil_ph",
-        "value": value,
-        "status": status,
-        "message": "Soil pH out of safe range",
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    client.publish(ALERT_TOPIC, json.dumps(payload), qos=1)
-    log_event("alert_sent", json.dumps(payload))
-
-
-def handle_sensor_message(data):
-    value = float(data.get("value", 0))
-    status = classify_ph(value)
-
-    save_data(data, status)
-
-    print("Received soil_ph =", value, f"({status})")
-
-    if status != "NORMAL":
-        publish_alert(value, status)
-
-
-def on_message(client, userdata, msg):
-    try:
-        payload = json.loads(msg.payload.decode())
-    except Exception as e:
-        print("Invalid JSON:", e)
-        return
-
-    if msg.topic == SENSOR_TOPIC:
-        handle_sensor_message(payload)
-    elif msg.topic == STATUS_TOPIC:
-        print("Status update:", payload)
-        log_event("status_received", json.dumps(payload))
-
-
-def main():
-    init_db()
-    client.on_message = on_message
-
-    try:
-        client.connect(BROKER, PORT, 60)
-        client.subscribe(SENSOR_TOPIC, qos=1)
-        client.subscribe(STATUS_TOPIC, qos=1)
-    except Exception as e:
-        print("soil_ph controller connection failed:", e)
-        return
-
-    print("Soil pH Controller connected")
-    print("Listening to:", SENSOR_TOPIC)
-
-    log_event("controller_started", "soil_ph controller started")
-
-    try:
-        client.loop_forever()
-    except KeyboardInterrupt:
-        print("Soil pH Controller stopped")
-    finally:
+    def on_message(self, client: mqtt.Client, userdata, msg: mqtt.MQTTMessage) -> None:
+        _ = (client, userdata)
         try:
-            log_event("controller_stopped", "soil_ph controller stopped")
-            client.disconnect()
-        except Exception:
-            pass
+            payload = json.loads(msg.payload.decode())
+        except json.JSONDecodeError:
+            return
+
+        if self.sensor_key not in payload:
+            return
+
+        plant_id = payload.get("plant_id", "unknown")
+        plant_type = payload.get("plant_type", "ficus")
+        profile = PLANT_PROFILES.get(plant_type)
+        if profile is None:
+            return
+
+        value = float(payload[self.sensor_key])
+        low, high = profile["soil_ph"]
+
+        print(
+            "[controller_ph]",
+            payload.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
+            plant_id,
+            f"soil_ph={value}",
+        )
+
+        severity, out_of_range = self._severity_for_value(value, low, high)
+        if out_of_range:
+            self._publish_alert(plant_id, plant_type, severity, value, low, high)
+        else:
+            self._clear_alert(plant_id)
+
+    def run(self) -> None:
+        self.client.connect(BROKER, PORT)
+        self.client.subscribe(self.topic_sub)
+        print(f"[controller_ph] listening: {self.topic_sub}")
+        self.client.loop_forever()
+
+
+def main() -> int:
+    controller = SensorController()
+    try:
+        controller.run()
+    except KeyboardInterrupt:
+        print("\n[controller_ph] stopped")
+        controller.client.disconnect()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
