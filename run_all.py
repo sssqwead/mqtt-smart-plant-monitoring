@@ -3,7 +3,7 @@ import time
 import signal
 import sys
 
-PLANT_TYPE = "ficus"
+PLANT_TYPES = ["ficus", "cactus"]
 
 controllers = [
     "controller_moisture.py",
@@ -38,18 +38,15 @@ def start_process(cmd):
 
 
 def start_all():
-    # Controllers
     for c in controllers:
         processes.append(start_process(["python", c]))
 
-    # небольшая пауза чтобы MQTT подписки успели подняться
     time.sleep(2)
 
-    # Publishers
-    for p in publishers:
-        processes.append(start_process(["python", p, PLANT_TYPE]))
+    for plant_type in PLANT_TYPES:
+        for p in publishers:
+            processes.append(start_process(["python", p, plant_type]))
 
-    # Dashboard (последним)
     processes.append(start_process(["python", "dashboard.py"]))
 
 
@@ -79,7 +76,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown)
 
     start_all()
-
     print("\n[run_all] system started. Press Ctrl+C to stop.\n")
 
     try:
